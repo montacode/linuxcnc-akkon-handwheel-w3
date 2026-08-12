@@ -1,0 +1,20 @@
+
+# 1. Skript laden
+loadusr -Wn akkon_w3 python3 /home/geri/linuxcnc/configs/probe_basic/python/akkon_w3_hal.py
+
+# 2. Direkte Zielwert-Steuerung aktivieren
+# Das sorgt dafür, dass halui nicht "addiert", sondern den Wert fest setzt
+setp halui.feed-override.direct-value 1
+setp halui.spindle.0.override.direct-value 1
+
+# 3. Empfindlichkeit einstellen
+# Da wir 0-200 als Wert schicken, muss die Skalierung auf 0.01 stehen, 
+# damit 200 * 0.01 = 2.0 (also 200%) ergibt.
+setp halui.feed-override.scale 0.01
+setp halui.spindle.0.override.scale 0.01
+
+# 4. Verbindungen herstellen
+net feed-counts akkon_w3.feed-counts => halui.feed-override.counts
+net speed-counts akkon_w3.speed-counts => halui.spindle.0.override.counts
+
+

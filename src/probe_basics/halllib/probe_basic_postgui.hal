@@ -1,0 +1,71 @@
+# --- Initialisierung & Timer ---
+loadrt time
+loadrt not
+addf time.0 servo-thread
+addf not.0 servo-thread
+#net prog-running not.0.in <= halui.program.is-idle
+#net prog-paused halui.program.is-paused => time.0.pause
+net cycle-timer time.0.start <= not.0.out
+
+loadrt oneshot count=1        # <--- WICHTIG: Das Modul muss hier geladen werden!
+addf oneshot.0 servo-thread
+setp oneshot.0.width 0.1
+
+# --- Jogging Anbindung ---
+
+# X-Achse
+net jog-x-counts   akkon_w3.jog-x-counts   => axis.x.jog-counts
+net jog-x-enable   akkon_w3.jog-x-enable   => axis.x.jog-enable
+
+# Y-Achse
+net jog-y-counts   akkon_w3.jog-y-counts   => axis.y.jog-counts
+net jog-y-enable   akkon_w3.jog-y-enable   => axis.y.jog-enable
+
+# Z-Achse
+net jog-z-counts   akkon_w3.jog-z-counts   => axis.z.jog-counts
+net jog-z-enable   akkon_w3.jog-z-enable   => axis.z.jog-enable
+
+# A-Achse
+net jog-a-counts   akkon_w3.jog-a-counts   => axis.a.jog-counts
+net jog-a-enable   akkon_w3.jog-a-enable   => axis.a.jog-enable
+
+# --- Zentrales Inkrement für Position-Modus ---
+# Hier wird der Wert vom Python-Skript (jog-increment) 
+# an alle Achsen-Skalen weitergegeben
+net jog-inc-val    akkon_w3.jog-increment  => axis.x.jog-scale axis.y.jog-scale axis.z.jog-scale axis.a.jog-scale
+
+# --- Velocity Mode Anbindung ---
+net jog-x-vel-mode akkon_w3.jog-x-vel-mode => axis.x.jog-vel-mode
+net jog-y-vel-mode akkon_w3.jog-y-vel-mode => axis.y.jog-vel-mode
+net jog-z-vel-mode akkon_w3.jog-z-vel-mode => axis.z.jog-vel-mode
+net jog-a-vel-mode akkon_w3.jog-a-vel-mode => axis.a.jog-vel-mode
+
+# Korrekt: Signal von deiner Komponente an den Eingang von halui
+net home-trigger akkon_w3.ref-all-trigger => halui.home-all
+
+# Spindelsteuerung
+net spindle-on-status spindle.0.on => akkon_w3.spindle-on-in
+# In die postgui.hal einfügen:
+net sp-start-trigger akkon_w3.spindle-start-trigger => halui.spindle.0.start
+net sp-stop-trigger  akkon_w3.spindle-stop-trigger  => halui.spindle.0.stop
+
+
+# Cycle Start
+net cycle-start-trigger akkon_w3.cycle-start-trigger => halui.program.run
+
+# Pause (Halui hat keinen einzelnen Pause-Pin, es ist oft ein Toggle oder kombiniert)
+# Meistens nutzt man halui.program.pause zum Anhalten
+net cycle-pause-trigger  akkon_w3.cycle-pause-trigger  => halui.program.pause
+
+# Stop
+#net cycle-stop-trigger   akkon_w3.cycle-stop-trigger   => halui.program.stop
+
+# Ändere die Zeilen in deiner postgui.hal auf diese eindeutigen Signale:
+
+net prog-running-sig  halui.program.is-running  => akkon_w3.program-is-running
+net prog-paused-sig   halui.program.is-paused   => akkon_w3.program-is-paused
+net prog-idle-sig     halui.program.is-idle     => akkon_w3.program-is-idle
+
+
+net stop-trigger  akkon_w3.cycle-stop-trigger  => oneshot.0.in
+net stop-pulse    oneshot.0.out                => halui.program.stop

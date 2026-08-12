@@ -1,0 +1,7 @@
+# 1. Die Schrittweite an die Achsen übergeben
+net h-schrittweite akkon_w3.jog-increment => axis.x.jog-scale axis.y.jog-scale axis.z.jog-scale
+
+# 2. Den Achsen sagen, ob sie im Schrittmodus (0) oder Kontinuierlich-Modus (1) laufen sollen.
+# Da der LinuxCNC-Pin 'jog-vel-mode' bei 1=Kontinuierlich und 0=Schrittweite arbeitet,
+# müssen wir das Signal im Skript oder hier richtig zuweisen.
+net h-modus akkon_w3.jog-mode-incremental => axis.x.jog-vel-mode axis.y.jog-vel-mode axis.z.jog-vel-mode
