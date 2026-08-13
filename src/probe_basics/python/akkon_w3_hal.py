@@ -1,39 +1,14 @@
 #!/usr/bin/env python3
-"""
-LinuxCNC interface for supporting AKKON Handwheel W3
-
-Create IO interface to form AKKON Handwheel to LinuxCNC and
-send commands
-
-Tested with LinuxCNC and probe-basic interface
-
-for installation, please read readme.txt
-installation steps
-copy akkon_w3_hal.py to /home/geri/linuxcnc/configs/probe_basic/python/
-copy handwheel_driver.py to /home/geri/linuxcnc/configs/probe_basic/python/
-copy custom.hal to /home/geri/linuxcnc/configs/probe_basic/
-copy postgui.hal to /home/geri/linuxcnc/configs/probe_basic/
-
-"""
-
-__version__ = "1.0.0"
-__author__ = "Geri"
-__status__ = "Development"  # z. B. Development, Prototype, Production
-
 import hal
 import time
-import os
 import sys
-import linuxcnc 
-from handwheel_driver import HandWheelDriver
+import linuxcnc
 import atexit
 import signal
-import threading
+from handwheel_driver import HandWheelDriver
+from gui_manager import GUIManager
 
-# Globales Event fuer sauberes Beenden definieren
-shutdown_event = threading.Event()
-
-# Komponente direkt und ohne Umwege fuer LinuxCNC twopass registrieren
+# HAL-Komponente fuer LinuxCNC twopass registrieren
 try:
     h = hal.component("akkon_w3")
 except hal.error as e:
@@ -55,7 +30,7 @@ for axis in axes:
     h.newpin(f"jog-{axis}-enable", hal.HAL_BIT, hal.HAL_OUT)
     h.newpin(f"jog-{axis}-wheel-active", hal.HAL_BIT, hal.HAL_OUT)
     h.newpin(f"jog-{axis}-vel-mode", hal.HAL_BIT, hal.HAL_OUT)
-    
+
 h.newpin("ref-all-trigger", hal.HAL_BIT, hal.HAL_OUT)    
 h.newpin("spindle-on-in", hal.HAL_BIT, hal.HAL_IN)
 h.newpin("spindle-start-trigger", hal.HAL_BIT, hal.HAL_OUT)
@@ -69,9 +44,10 @@ h.newpin("program-is-idle", hal.HAL_BIT, hal.HAL_IN)
 
 h.ready()
 
-# Initialwerte
+# Initialwerte & Instanzen
 h['jog-increment'] = 0.0
 cnc_cmd = linuxcnc.command()
+gui = GUIManager()
 
 def on_feed_changed(sender, value):
     h['feed-counts'] = int(value / 5.12)
@@ -96,8 +72,62 @@ def trigger_cycle_pause():
     cnc_cmd.auto(linuxcnc.AUTO_PAUSE, 1)
     print("Cycle Pause ausgeloest")    
 
+def ausfuehren_werkzeugwechsel(tool_number):
+    """Fuehrt den Werkzeugwechsel per MDI in LinuxCNC aus."""
+    try:
+        cnc_stat = linuxcnc.stat()
+        cnc_stat.poll()
+
+        if cnc_stat.estop:
+            print("[FEHLER] Werkzeugwechsel nicht moeglich: ESTOP ist aktiv!")
+            return
+
+        if not cnc_stat.enabled:
+            print("[FEHLER] Werkzeugwechsel nicht moeglich: Maschine ist OFF!")
+            return
+
+        print(f"[LinuxCNC] Starte Werkzeugwechsel auf T{tool_number}...")
+        cnc_cmd.mode(linuxcnc.MODE_MDI)
+        cnc_cmd.wait_complete(2.0)
+        
+        command_str = f"M6 T{int(tool_number)} G43"
+        print(f"[LinuxCNC] Sende MDI: {command_str}")
+        cnc_cmd.mdi(command_str)
+        cnc_cmd.wait_complete(5.0)
+        
+        cnc_cmd.mode(linuxcnc.MODE_MANUAL)
+        cnc_cmd.wait_complete(2.0)
+        print(f"[LinuxCNC] Werkzeug T{tool_number} erfolgreich gewechselt.")
+
+    except Exception as e:
+        print(f"[FEHLER] Werkzeugwechsel fehlgeschlagen: {e}")
+
 def on_key_down(s, key):
     print("Taste ", key)
+
+# --- DIALOG-STEUERUNG (falls Fenster offen ist) ---
+    if gui.is_dialog_open:
+        if key == s.KEY_ENTER:  # Taste 23
+            print("[GUI] Enter gedrueckt - Versuche Werkzeug zu lesen...")
+
+            def on_tool_selected(selected_tool):
+                print(f"[DEBUG] Ausgewaehltes Werkzeug: {selected_tool}")
+                
+                if selected_tool is not None:
+                    ausfuehren_werkzeugwechsel(selected_tool)
+                else:
+                    print("[FEHLER] 'selected_tool' war None! Kein Werkzeug erkannt.")
+
+            # Liest Wert aus, SCHLIESST DAS FENSTER und ruft dann on_tool_selected auf
+            gui.get_selected_tool_async(on_tool_selected)
+            return   
+        # 2. Escape-Taste: Dialog einfach abbrechen & schließen
+        elif key == s.KEY_ESC:
+            print("[GUI] Escape gedrueckt - Schliesse Werkzeugdialog ohne Auswahl...")
+            gui.close_dialog()
+            return         
+     
+    # --- NORMALE TASTENFUNKTIONEN ---
     if key == s.KEY_STOP:
         print("Stop pressed")
         h["cycle-stop-trigger"] = True
@@ -116,13 +146,11 @@ def on_key_down(s, key):
             h["spindle-stop-trigger"] = True
             time.sleep(0.1)
             h["spindle-stop-trigger"] = False
-            print("Spindle off")
         else:
             hw.set_led(hw.LED_SPINDLE, True)        
             h["spindle-start-trigger"] = True
             time.sleep(0.1)
-            h["spindle-start-trigger"] = False  
-            print("Spindle on")          
+            h["spindle-start-trigger"] = False            
             
     elif key == s.KEY_W0X:
         if hw.FNbtn_pressed():
@@ -130,7 +158,7 @@ def on_key_down(s, key):
             h["ref-all-trigger"] = True
             time.sleep(0.1)
             h["ref-all-trigger"] = False
-            print("REFALL-Prozess wurde an LinuxCNC uebergeben.")           
+            print("REFALL-Prozess wurde an LinuxCNC uebergeben.")            
         else:
             print("Keine Funktionstaste: Setze X-Werkstuecknullpunkt...")
             cnc_cmd.mode(linuxcnc.MODE_MDI)
@@ -153,23 +181,30 @@ def on_key_down(s, key):
         hw.SetMoveMode(modes[state])
         print(f"Modus: {labels[state]}")
 
-    elif key == s.KEY_ENTER:
-        print("Enter presssed")
-    elif key == s.KEY_ESC:
-        print("ESC pressed")
+    elif key == s.KEY_TOOL:
+        print("Tool pressed -> Oeffne/Schließe Dialog")
+        gui.zeige_werkzeug_dialog()
 
 # Statuskonstanten
 SIGNAL_POS_EDGE, SIGNAL_HI = 1, 2
 state = 0
-continuous_mode = True 
-last_time = time.time()
-
-# Globale Variable fuer den Takt
 jog_counters = {'x': 0, 'y': 0, 'z': 0, 'a': 0}
 
 def on_cursor_changed(s, cursor_keys):
     global h, jog_counters
     
+    # --- NAVIGATION IM TOOLDIALOG ---
+    if gui.is_dialog_open:
+        up_triggered = cursor_keys[2].TriggerState == SIGNAL_POS_EDGE
+        down_triggered = cursor_keys[3].TriggerState == SIGNAL_POS_EDGE
+
+        if up_triggered:
+            gui.move_up()
+        elif down_triggered:
+            gui.move_down()
+        return
+
+    # --- NORMALE JOG-LOGIK ---
     try:
         feed = h['feed-counts']
     except:
@@ -210,7 +245,6 @@ hw.OnCursorKeyChanged = on_cursor_changed
 hw.connect()
 
 def sauberes_beenden():
-    """Wird beim Beenden des Skripts aufgerufen, um Ressourcen freizugeben."""
     print("\n[INFO] Speicher und Schnittstellen werden bereinigt...")
     try:
         if 'hw' in globals() and hasattr(hw, 'disconnect'):
@@ -222,27 +256,25 @@ def sauberes_beenden():
         if 'h' in globals():
             h.exit()
             print("[INFO] HAL-Komponente erfolgreich entladen.")
-    except Exception as e:
-        print(f"Fehler beim Beenden der HAL-Komponente: {e}")
+    except:
+        pass
 
 def signal_handler_beenden(signum, frame):
-    """Setzt das Event, damit die Hauptschleife kontrolliert beendet wird."""
-    print(f"\n[INFO] Signal {signum} empfangen. Beende Hauptschleife...")
-    shutdown_event.set()
+    print(f"\n[INFO] Signal {signum} empfangen (Terminal geschlossen). Raeume auf...")
+    sauberes_beenden()
+    sys.exit(0)
 
-# Registriere Signale für SIGINT (Strg+C), SIGHUP und SIGTERM
-signal.signal(signal.SIGINT, signal_handler_beenden)
 signal.signal(signal.SIGHUP, signal_handler_beenden)
 signal.signal(signal.SIGTERM, signal_handler_beenden)
 atexit.register(sauberes_beenden)
 
-print("[INFO] Skript aktiv. Hauptschleife gestartet.")
+print("[INFO] Skript aktiv. Starte GUI-Schleife.")
 try:
-    # Unterbrechbarer Sleep, reagiert sofort auf Strg+C
-    while not shutdown_event.is_set():
-        shutdown_event.wait(timeout=0.2)
+    gui.mainloop()
 except KeyboardInterrupt:
-    print("\n[INFO] KeyboardInterrupt gefangen.")
+    print("\n[INFO] Abbruch durch Benutzer (Strg+C).")
+except Exception as e:
+    print(f"\n[FEHLER] Unerwarteter Absturz: {e}")
 finally:
     sauberes_beenden()
     print("[INFO] Anwendung sauber beendet. Auf Wiedersehen.")
