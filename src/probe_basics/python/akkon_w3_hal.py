@@ -5,6 +5,7 @@ import sys
 import linuxcnc
 import atexit
 import signal
+import threading
 from handwheel_driver import HandWheelDriver
 from gui_manager import GUIManager
 
@@ -32,6 +33,8 @@ for axis in axes:
     h.newpin(f"jog-{axis}-vel-mode", hal.HAL_BIT, hal.HAL_OUT)
 
 h.newpin("ref-all-trigger", hal.HAL_BIT, hal.HAL_OUT)    
+h.newpin("unhome-all-trigger", hal.HAL_BIT, hal.HAL_OUT)
+
 h.newpin("spindle-on-in", hal.HAL_BIT, hal.HAL_IN)
 h.newpin("spindle-start-trigger", hal.HAL_BIT, hal.HAL_OUT)
 h.newpin("spindle-stop-trigger", hal.HAL_BIT, hal.HAL_OUT) 
@@ -71,41 +74,56 @@ def trigger_cycle_stop():
 def trigger_cycle_pause():
     cnc_cmd.auto(linuxcnc.AUTO_PAUSE, 1)
     print("Cycle Pause ausgeloest")    
-
 def ausfuehren_werkzeugwechsel(tool_number):
-    """Fuehrt den Werkzeugwechsel per MDI in LinuxCNC aus."""
+    """Startet den manuellen Werkzeugwechsel inkl. Fahrt, Pause & Vermessung."""
     try:
         cnc_stat = linuxcnc.stat()
         cnc_stat.poll()
 
-        if cnc_stat.estop:
-            print("[FEHLER] Werkzeugwechsel nicht moeglich: ESTOP ist aktiv!")
+        if cnc_stat.estop or not cnc_stat.enabled:
+            print("[FEHLER] Werkzeugwechsel nicht moeglich: Maschine aus oder ESTOP!")
             return
 
-        if not cnc_stat.enabled:
-            print("[FEHLER] Werkzeugwechsel nicht moeglich: Maschine ist OFF!")
-            return
+        if cnc_stat.interp_state != linuxcnc.INTERP_IDLE:
+            print("[FEHLER] Interpreter ist nicht IDLE! Breche alte Aktionen ab...")
+            cnc_cmd.abort()
+            cnc_cmd.wait_complete(0.2)
 
-        print(f"[LinuxCNC] Starte Werkzeugwechsel auf T{tool_number}...")
+        tool_nr = int(tool_number)
+        print(f"[LinuxCNC] Starte Werkzeugwechsel-Routine auf T{tool_nr}...")
+
+        # 1. In MDI-Modus wechseln
         cnc_cmd.mode(linuxcnc.MODE_MDI)
-        cnc_cmd.wait_complete(2.0)
-        
-        command_str = f"M6 T{int(tool_number)} G43"
-        print(f"[LinuxCNC] Sende MDI: {command_str}")
-        cnc_cmd.mdi(command_str)
-        cnc_cmd.wait_complete(5.0)
-        
-        cnc_cmd.mode(linuxcnc.MODE_MANUAL)
-        cnc_cmd.wait_complete(2.0)
-        print(f"[LinuxCNC] Werkzeug T{tool_number} erfolgreich gewechselt.")
+        cnc_cmd.wait_complete(0.1)
+
+        # 2. Nur T<nr> M6 senden (OHNE nachfolgendes G43)
+        # T<nr> M6 startet die Probe Basic Subroutine:
+        # -> Faehrt auf Wechselpos
+        # -> Stoppt Spindel
+        # -> Öffnet Dialog / Wartet auf OK
+        cmd_m6 = f"T{tool_nr} M6"
+        print(f"[LinuxCNC] Sende MDI: {cmd_m6}")
+        cnc_cmd.mdi(cmd_m6)
+
+        print(f"[LinuxCNC] Wechselbefehl T{tool_nr} gesendet. Bitte am Bildschirm / Dialog bestaetigen!")
 
     except Exception as e:
-        print(f"[FEHLER] Werkzeugwechsel fehlgeschlagen: {e}")
+        print(f"[FEHLER] Werkzeugwechsel fehlgeschlagen: {e}")    
+
+    
+
+
+def trigger_hal_pulse(pin_name):
+    """Setzt einen HAL-Pin unblockierend fuer 100ms auf True und danach wieder auf False."""
+    h[pin_name] = True
+    # threading.Timer blockiert weder die GUI noch den Handrad-Loop
+    threading.Timer(0.1, lambda: h.__setitem__(pin_name, False)).start()
+
 
 def on_key_down(s, key):
     print("Taste ", key)
 
-# --- DIALOG-STEUERUNG (falls Fenster offen ist) ---
+    # --- 1. DIALOG-STEUERUNG (Falls Handrad-Werkzeugdialog offen ist) ---
     if gui.is_dialog_open:
         if key == s.KEY_ENTER:  # Taste 23
             print("[GUI] Enter gedrueckt - Versuche Werkzeug zu lesen...")
@@ -118,20 +136,40 @@ def on_key_down(s, key):
                 else:
                     print("[FEHLER] 'selected_tool' war None! Kein Werkzeug erkannt.")
 
-            # Liest Wert aus, SCHLIESST DAS FENSTER und ruft dann on_tool_selected auf
             gui.get_selected_tool_async(on_tool_selected)
             return   
-        # 2. Escape-Taste: Dialog einfach abbrechen & schließen
+            
         elif key == s.KEY_ESC:
             print("[GUI] Escape gedrueckt - Schliesse Werkzeugdialog ohne Auswahl...")
             gui.close_dialog()
             return         
-     
-    # --- NORMALE TASTENFUNKTIONEN ---
+
+    # --- 2. WERKZEUGWECHSEL BESTÄTIGEN (Wenn Dialog ZU ist & LinuxCNC auf G8 wartet) ---
+    elif key == s.KEY_ENTER:
+        try:
+            cnc_stat = linuxcnc.stat()
+            cnc_stat.poll()
+            
+            # Pruefen, ob die Maschine paussiert ist / auf Bestaetigung wartet (G8 / INTERP_PAUSED)
+            if cnc_stat.interp_state in [linuxcnc.INTERP_PAUSED, 8]:
+                print("[Handrad] ENTER gedrueckt -> Sende Tool-Changed Signal (OK) an LinuxCNC...")
+
+                # HAL-Signal kurz auf True setzen und nach 100ms wieder abfallen lassen
+                hal.set_p("halui.tool.changed", "1")
+                threading.Timer(0.1, lambda: hal.set_p("halui.tool.changed", "0")).start()
+
+            else:
+                print("[Handrad] ENTER gedrueckt (Keine Werkzeugwechsel-Pause aktiv).")
+
+        except Exception as e:
+            print(f"[FEHLER] Bestaetigung fehlgeschlagen: {e}")
+        return
+
+    # --- 3. NORMALE TASTENFUNKTIONEN ---
     if key == s.KEY_STOP:
         print("Stop pressed")
-        h["cycle-stop-trigger"] = True
-        h["cycle-stop-trigger"] = False
+        trigger_hal_pulse("cycle-stop-trigger")
+
     elif key == s.KEY_RUN:
         print("Run pressed")
         if h["program-is-idle"]:
@@ -140,35 +178,41 @@ def on_key_down(s, key):
             trigger_cycle_resume()
         else: 
             trigger_cycle_pause() 
-    elif key == s.KEY_SPINDLE_ON_OFF:                     
+
+    elif key == s.KEY_SPINDLE_ON_OFF:                       
         if h["spindle-on-in"]:
             hw.set_led(hw.LED_SPINDLE, False)        
-            h["spindle-stop-trigger"] = True
-            time.sleep(0.1)
-            h["spindle-stop-trigger"] = False
+            trigger_hal_pulse("spindle-stop-trigger")
         else:
             hw.set_led(hw.LED_SPINDLE, True)        
-            h["spindle-start-trigger"] = True
-            time.sleep(0.1)
-            h["spindle-start-trigger"] = False            
+            trigger_hal_pulse("spindle-start-trigger")            
             
     elif key == s.KEY_W0X:
         if hw.FNbtn_pressed():
-            print("Sicherheits-Referenzierung gestartet...")
-            h["ref-all-trigger"] = True
-            time.sleep(0.1)
-            h["ref-all-trigger"] = False
-            print("REFALL-Prozess wurde an LinuxCNC uebergeben.")            
+            cnc_stat = linuxcnc.stat()
+            cnc_stat.poll()
+            
+            # True wenn alle 3 Haupt-Achsen (X, Y, Z) referenziert sind
+            is_homed = all(cnc_stat.homed[:3])
+
+            if not is_homed:
+                print("[Handrad] Maschine ist UNHOMED -> Starte Referenzierung (REF ALL)...")
+                trigger_hal_pulse("ref-all-trigger")
+            else:
+                print("[Handrad] Maschine ist HOMED -> Hebe Referenzierung auf (UNHOME ALL)...")
+                try:
+                    cnc_cmd.teleop_enable(0)
+                    for joint_num in range(3):
+                        cnc_cmd.unhome(joint_num)
+                    print("[Handrad] UNHOME-Befehl erfolgreich an LinuxCNC gesendet.")
+                except Exception as e:
+                    print(f"[FEHLER] Unhome fehlgeschlagen: {e}")
         else:
             print("Keine Funktionstaste: Setze X-Werkstuecknullpunkt...")
             cnc_cmd.mode(linuxcnc.MODE_MDI)
-            cnc_cmd.wait_complete()
             cnc_cmd.mdi("G10 L20 P0 X0 Y0 Z0 B0 C0")
-            cnc_cmd.wait_complete()
-            cnc_cmd.mode(linuxcnc.MODE_MANUAL)
-            cnc_cmd.wait_complete()
-            print("X-Nullpunkt gesetzt.")        
-     
+            print("X-Nullpunkt gesetzt.")
+            
     elif key == s.KEY_JOG:
         global state, current_speed
         state = (state + 1) % 4
@@ -182,8 +226,10 @@ def on_key_down(s, key):
         print(f"Modus: {labels[state]}")
 
     elif key == s.KEY_TOOL:
-        print("Tool pressed -> Oeffne/Schließe Dialog")
+        print("Tool pressed -> Oeffne/Schliesse Dialog")
         gui.zeige_werkzeug_dialog()
+
+
 
 # Statuskonstanten
 SIGNAL_POS_EDGE, SIGNAL_HI = 1, 2
@@ -193,7 +239,6 @@ jog_counters = {'x': 0, 'y': 0, 'z': 0, 'a': 0}
 def on_cursor_changed(s, cursor_keys):
     global h, jog_counters
     
-    # --- NAVIGATION IM TOOLDIALOG ---
     if gui.is_dialog_open:
         up_triggered = cursor_keys[2].TriggerState == SIGNAL_POS_EDGE
         down_triggered = cursor_keys[3].TriggerState == SIGNAL_POS_EDGE
@@ -204,16 +249,15 @@ def on_cursor_changed(s, cursor_keys):
             gui.move_down()
         return
 
-    # --- NORMALE JOG-LOGIK ---
     try:
         feed = h['feed-counts']
     except:
         feed = 0
     
     factor = 1 if feed >= 25 else 0
-    axes = ['x', 'y', 'z', 'a']
+    axes_list = ['x', 'y', 'z', 'a']
     
-    for i, axis in enumerate(axes):
+    for i, axis in enumerate(axes_list):
         pos_idx = i * 2
         neg_idx = i * 2 + 1
         
@@ -233,8 +277,6 @@ def on_cursor_changed(s, cursor_keys):
         else:
             h[f'jog-{axis}-enable'] = False
             h[f'jog-{axis}-wheel-active'] = False
-            
-    print(f"[Jog] Poti={feed} | X={jog_counters['x']} Y={jog_counters['y']} Z={jog_counters['z']} A={jog_counters['a']}")
 
 # Verbindung aufbauen
 hw = HandWheelDriver(port='/dev/ttyUSB0')
