@@ -5,12 +5,22 @@ Handles HAL pins, handwheel events, and GUI tool selector interaction.
 """
 
 import sys
+import os
 import time
 import signal
 import atexit
 import threading
+
+# Script-Verzeichnis zum Python-Suchpfad hinzufuegen
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 import hal
 import linuxcnc
+
+from qtpy.QtCore import QCoreApplication, Qt
+from qtpy.QtGui import QKeyEvent
 
 from handwheel_driver import HandWheelDriver
 from gui_manager import GUIManager
@@ -50,6 +60,7 @@ class AkkonHALController:
             self.hw.KEY_W0X: self._handle_w0x,
             self.hw.KEY_JOG: self._handle_jog_mode,
             self.hw.KEY_TOOL: self._handle_tool_dialog,
+            self.hw.KEY_ESC: self._handle_esc,
         }
 
     def _init_hal(self):
@@ -76,7 +87,7 @@ class AkkonHALController:
             h.newpin(f"jog-{axis}-wheel-active", hal.HAL_BIT, hal.HAL_OUT)
             h.newpin(f"jog-{axis}-vel-mode", hal.HAL_BIT, hal.HAL_OUT)
 
-        # Homining & Trigger Pins
+        # Homing & Trigger Pins
         h.newpin("ref-all-trigger", hal.HAL_BIT, hal.HAL_OUT)
         h.newpin("unhome-all-trigger", hal.HAL_BIT, hal.HAL_OUT)
 
@@ -127,7 +138,7 @@ class AkkonHALController:
                 self.gui.move_down()
             return
 
-        # 2. Regulärer Jog-Betrieb
+        # 2. Regulaerer Jog-Betrieb
         try:
             feed = self.h['feed-counts']
         except Exception:
@@ -210,27 +221,36 @@ class AkkonHALController:
             self.trigger_hal_pulse("spindle-start-trigger")
 
     def _handle_w0x(self):
+        """Behandelt die W0X / Ref-Taste des Handrads."""
         if self.hw.FNbtn_pressed():
             self.cnc_stat.poll()
-            is_homed = all(self.cnc_stat.homed[:3])
 
-            if not is_homed:
-                print("[Handrad] Maschine ist UNHOMED -> Starte Referenzierung (REF ALL)...")
-                self.trigger_hal_pulse("ref-all-trigger")
-            else:
-                print("[Handrad] Maschine ist HOMED -> Hebe Referenzierung auf (UNHOME ALL)...")
+            if self.cnc_stat.interp_state == linuxcnc.INTERP_IDLE:
+                print("[Handrad] Schalte in Joint-Modus fuer Referenzfahrt...")
                 try:
-                    self.cnc_cmd.teleop_enable(0)
-                    for joint_num in range(3):
-                        self.cnc_cmd.unhome(joint_num)
-                    print("[Handrad] UNHOME-Befehl erfolgreich gesendet.")
+                    self.cnc_cmd.mode(linuxcnc.MODE_MANUAL)
+                    self.cnc_cmd.teleop_enable(False)
+                    self.cnc_cmd.wait_complete(0.2)
+
+                    print("[Handrad] Starte Referenzfahrt (REF ALL / RE-HOME)...")
+                    self.trigger_hal_pulse("ref-all-trigger")
                 except Exception as e:
-                    print(f"[FEHLER] Unhome fehlgeschlagen: {e}")
+                    print(f"[FEHLER] Umschalten in Joint-Modus fehlgeschlagen: {e}")
+            else:
+                print("[WARNUNG] Referenzfahrt ignoriert: Maschine ist nicht im Leerlauf (IDLE).")
         else:
-            print("[Handrad] Setze X-Werkstuecknullpunkt...")
-            self.cnc_cmd.mode(linuxcnc.MODE_MDI)
-            self.cnc_cmd.mdi("G10 L20 P0 X0 Y0 Z0 B0 C0")
-            print("[Handrad] Nullpunkt gesetzt.")
+            print("[Handrad] Setze X-Werkstuecknullpunkt (G10 L20 P0 X0)...")
+            try:
+                self.cnc_stat.poll()
+                if self.cnc_stat.interp_state == linuxcnc.INTERP_IDLE:
+                    self.cnc_cmd.mode(linuxcnc.MODE_MDI)
+                    self.cnc_cmd.wait_complete(0.2)
+                    self.cnc_cmd.mdi("G10 L20 P0 X0")
+                    print("[Handrad] X-Nullpunkt erfolgreich gesetzt.")
+                else:
+                    print("[WARNUNG] Nullpunkt setzen ignoriert: Interpreter ist nicht IDLE.")
+            except Exception as e:
+                print(f"[FEHLER] Nullpunkt setzen fehlgeschlagen: {e}")
 
     def _handle_jog_mode(self):
         self.state = (self.state + 1) % 4
@@ -246,6 +266,15 @@ class AkkonHALController:
     def _handle_tool_dialog(self):
         print("[Handrad] Tool pressed -> Oeffne/Schliesse Dialog")
         self.gui.zeige_werkzeug_dialog()
+
+    def _handle_esc(self):
+        """Behandelt die ESC-Taste des Handrads."""
+        print("[Handrad] ESC gedrueckt -> Schliesse Dialoge / Breche ab...")
+        self.close_open_dialogs()
+        try:
+            self.cnc_cmd.abort()
+        except Exception as e:
+            print(f"[FEHLER] Abort fehlgeschlagen: {e}")
 
     def _handle_enter_confirm(self):
         try:
@@ -290,7 +319,44 @@ class AkkonHALController:
 
         except Exception as e:
             print(f"[FEHLER] Werkzeugwechsel fehlgeschlagen: {e}")
+ 
+    def close_open_dialogs(self):
+        """Schliesst Popups, Error-Notifications und Dialoge in Probe Basic/QtPyVCP."""
+        # 1. QtPyVCP Notifications & DialogManager direkt im Speicher schliessen
+        try:
+            from qtpyvcp.widgets.dialogs import DialogManager
+            if hasattr(DialogManager, 'close_all'):
+                DialogManager.close_all()
+        except Exception as e:
+            print(f"[DEBUG] DialogManager-Close: {e}")
 
+        try:
+            from qtpyvcp.utilities.notifications import NotificationManager
+            if hasattr(NotificationManager, 'clear_all'):
+                NotificationManager.clear_all()
+            elif hasattr(NotificationManager, 'close_all'):
+                NotificationManager.close_all()
+        except Exception as e:
+            print(f"[DEBUG] NotificationManager-Close: {e}")
+
+        # 2. Fallback: Systemweites ESC-Event ueber xdotool an die aktive LinuxCNC GUI senden
+        try:
+            import subprocess
+            subprocess.Popen(["xdotool", "key", "Escape"])
+            print("[Handrad] ESC via xdotool an System/Probe Basic gesendet.")
+        except Exception:
+            # Falls xdotool nicht installiert ist, Fallback auf xte
+            try:
+                import subprocess
+                subprocess.Popen(["xte", "key Escape"])
+            except Exception as e:
+                print(f"[FEHLER] xdotool/xte nicht verfuegbar: {e}")
+
+        # 3. Fallback: Eigener Werkzeug-Dialog
+        if hasattr(self, 'gui') and self.gui.is_dialog_open:
+            self.gui.close_dialog() 
+    
+   
     def cleanup(self):
         """Bereinigt Ressourcen beim Beenden."""
         print("\n[INFO] Speicher und Schnittstellen werden bereinigt...")
